@@ -199,6 +199,40 @@
   }
   .day-city { font-size: 12.5px; color: var(--ink-soft); margin-top: 2px; }
 
+  .weather-card {
+    margin: 12px 2px 0; padding: 14px 16px; border-radius: var(--radius);
+    border: 1px solid var(--line); background: var(--surface); box-shadow: var(--shadow);
+    display: flex; flex-direction: column; gap: 9px;
+  }
+  .weather-live-tag {
+    align-self: flex-start; font-size: 10.5px; font-weight: 800; letter-spacing: .02em;
+    color: var(--ochre); background: var(--ochre-soft); border-radius: 100px; padding: 3px 9px;
+  }
+  .weather-main { display: flex; align-items: baseline; gap: 10px; }
+  .weather-emoji { font-size: 28px; line-height: 1; }
+  .weather-temps { font-family: var(--font-display); font-size: 22px; font-weight: 600; }
+  .weather-tmin { color: var(--ink-faint); font-size: 15px; font-weight: 500; margin-left: 2px; }
+  .weather-desc { font-size: 13px; color: var(--ink-soft); font-weight: 600; }
+  .weather-sub {
+    display: flex; justify-content: space-between; gap: 10px;
+    font-size: 12px; color: var(--ink-soft); font-variant-numeric: tabular-nums;
+  }
+  .weather-footer {
+    display: flex; justify-content: space-between; align-items: center; gap: 10px;
+    padding-top: 8px; border-top: 1px solid var(--line);
+  }
+  .weather-updated { font-size: 11px; color: var(--ink-faint); }
+  .weather-refresh-btn {
+    flex: 0 0 auto; font-family: var(--font-body); font-size: 11.5px; font-weight: 700; color: var(--accent);
+    background: var(--accent-soft); border: none; border-radius: 100px; padding: 6px 11px; cursor: pointer;
+  }
+  .weather-refresh-btn:disabled { opacity: .6; cursor: default; }
+  .weather-card-empty, .weather-card-loading {
+    margin: 12px 2px 0; padding: 12px 14px; border-radius: var(--radius-sm);
+    background: var(--surface-2); color: var(--ink-soft); font-size: 12.5px; line-height: 1.6;
+    display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px;
+  }
+
   .day-hero {
     border-radius: var(--radius); overflow: hidden; margin: 14px 2px 10px;
     border: 1px solid var(--line); box-shadow: var(--shadow); background: var(--surface);
@@ -880,6 +914,158 @@ const DAYS = [
     ]},
 ];
 
+/* ============ 每日天氣（Open-Meteo，免金鑰、可即時更新） ============ */
+const CITY_GEO = {
+  taipei: { label:"台北", lat:25.0330, lon:121.5654, tz:"Asia/Taipei" },
+  sydney: { label:"雪梨", lat:-33.8688, lon:151.2093, tz:"Australia/Sydney" },
+  melbourne: { label:"墨爾本", lat:-37.8136, lon:144.9631, tz:"Australia/Melbourne" },
+};
+// 對應 DAYS[] 每一天所在城市；9/18出發當天與9/28返抵當天都算台北
+const DAY_GEO = ["taipei","sydney","sydney","sydney","sydney","melbourne","melbourne","melbourne","melbourne","melbourne","taipei"];
+const TRIP_YEAR = 2026;
+const WEATHER_CACHE_MS = 3 * 60 * 60 * 1000; // 3小時內自動使用快取，超過或手動按重新整理才會重打 API
+
+function dayToISODate(d){
+  const [m, day] = d.split('/').map(Number);
+  return `${TRIP_YEAR}-${String(m).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
+}
+function currentHourlyReading(hourly){
+  if (!hourly || !hourly.time || !hourly.time.length) return null;
+  const now = new Date();
+  let bestIdx = 0;
+  for (let i=0;i<hourly.time.length;i++){
+    if (new Date(hourly.time[i]) <= now) bestIdx = i; else break;
+  }
+  return {
+    time: hourly.time[bestIdx],
+    temp: hourly.temperature_2m ? hourly.temperature_2m[bestIdx] : null,
+    precip: hourly.precipitation ? hourly.precipitation[bestIdx] : null,
+    pop: hourly.precipitation_probability ? hourly.precipitation_probability[bestIdx] : null,
+    wcode: hourly.weathercode ? hourly.weathercode[bestIdx] : 0,
+  };
+}
+function weatherIcon(code){
+  if (code === 0) return '☀️';
+  if (code === 1 || code === 2) return '🌤️';
+  if (code === 3) return '☁️';
+  if (code === 45 || code === 48) return '🌫️';
+  if ([51,53,55,56,57].includes(code)) return '🌦️';
+  if ([61,63,65,66,67,80,81,82].includes(code)) return '🌧️';
+  if ([71,73,75,77,85,86].includes(code)) return '🌨️';
+  if ([95,96,99].includes(code)) return '⛈️';
+  return '🌡️';
+}
+function weatherDesc(code){
+  const map = {0:'晴朗',1:'大致晴朗',2:'多雲時晴',3:'多雲',45:'有霧',48:'有霧',
+    51:'毛毛雨',53:'毛毛雨',55:'毛毛雨',56:'凍雨',57:'凍雨',
+    61:'小雨',63:'中雨',65:'大雨',66:'凍雨',67:'凍雨',
+    71:'小雪',73:'中雪',75:'大雪',77:'雪粒',
+    80:'短暫陣雨',81:'陣雨',82:'強陣雨',85:'陣雪',86:'強陣雪',
+    95:'雷雨',96:'雷雨挾冰雹',99:'雷雨挾冰雹'};
+  return map[code] || '天氣狀況不明';
+}
+let weatherCache = lsGet('ausTripWeatherCache', {});
+let weatherLoading = {};
+function reRenderItinerary(){
+  const el = document.getElementById('view-itinerary');
+  if (el) el.innerHTML = renderItinerary();
+}
+async function fetchWeather(geoKey){
+  const geo = CITY_GEO[geoKey];
+  if (!geo) return;
+  weatherLoading[geoKey] = true;
+  reRenderItinerary();
+  try {
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${geo.lat}&longitude=${geo.lon}&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max&hourly=temperature_2m,precipitation,precipitation_probability,weathercode&timezone=${encodeURIComponent(geo.tz)}&forecast_days=16`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('weather http ' + res.status);
+    const data = await res.json();
+    weatherCache[geoKey] = { fetchedAt: Date.now(), daily: data.daily, hourly: data.hourly };
+    lsSet('ausTripWeatherCache', weatherCache);
+  } catch(e){
+    window.lastWeatherError = (e && e.message) || String(e);
+  } finally {
+    weatherLoading[geoKey] = false;
+    reRenderItinerary();
+  }
+}
+function refreshWeather(){
+  const geoKey = DAY_GEO[activeDay];
+  if (geoKey && geoKey !== 'none') fetchWeather(geoKey);
+}
+function initWeather(){
+  Object.keys(CITY_GEO).forEach(key=>{
+    const cache = weatherCache[key];
+    const stale = !cache || (Date.now() - cache.fetchedAt > WEATHER_CACHE_MS);
+    if (stale) fetchWeather(key);
+  });
+}
+function renderWeatherCard(){
+  const geoKey = DAY_GEO[activeDay];
+  if (!geoKey || geoKey === 'none'){
+    return `<div class="weather-card-empty">${icon('plane')}這天在移動或已結束行程，沒有對應的單一城市天氣</div>`;
+  }
+  const geo = CITY_GEO[geoKey];
+  const loading = !!weatherLoading[geoKey];
+  const cache = weatherCache[geoKey];
+
+  if (!cache && loading){
+    return `<div class="weather-card-loading">正在讀取${geo.label}天氣...</div>`;
+  }
+  if (!cache){
+    return `<div class="weather-card-empty">尚未讀取${geo.label}天氣<button type="button" class="weather-refresh-btn" onclick="refreshWeather()">讀取天氣</button></div>`;
+  }
+  const updatedStr = new Date(cache.fetchedAt).toLocaleString('zh-TW', {month:'numeric', day:'numeric', hour:'2-digit', minute:'2-digit'});
+  const iso = dayToISODate(DAYS[activeDay].d);
+  const idx = (cache.daily.time||[]).indexOf(iso);
+  if (idx === -1){
+    const live = currentHourlyReading(cache.hourly);
+    if (live){
+      return `<div class="weather-card weather-card-live">
+        <div class="weather-live-tag">目前即時天氣，非${DAYS[activeDay].d}當天預報</div>
+        <div class="weather-main">
+          <div class="weather-emoji">${weatherIcon(live.wcode)}</div>
+          <div class="weather-temps"><span class="weather-tmax">${Math.round(live.temp)}°C</span></div>
+          <div class="weather-desc">${weatherDesc(live.wcode)}</div>
+        </div>
+        <div class="weather-sub">
+          <span>${geo.label}　·　現在</span>
+          <span>☔ ${live.pop!=null?`降雨機率 ${live.pop}%`:''}${live.precip?`　·　${live.precip}mm`:''}</span>
+        </div>
+        <div class="weather-footer">
+          <span class="weather-updated">${DAYS[activeDay].d} 預報要等出發前約16天內才會開放，屆時會自動換成當天預報</span>
+          <button type="button" class="weather-refresh-btn" onclick="refreshWeather()" ${loading?'disabled':''}>${loading?'更新中…':'🔄 重新整理'}</button>
+        </div>
+      </div>`;
+    }
+    return `<div class="weather-card-empty">
+      ${geo.label}　${DAYS[activeDay].d} 距離現在較遠，天氣預報通常只開放未來16天內，晚點再回來看看，或手動重新整理
+      <button type="button" class="weather-refresh-btn" onclick="refreshWeather()" ${loading?'disabled':''}>${loading?'讀取中…':'🔄 重新整理'}</button>
+      <span class="weather-updated">最後讀取：${updatedStr}</span>
+    </div>`;
+  }
+  const tmax = Math.round(cache.daily.temperature_2m_max[idx]);
+  const tmin = Math.round(cache.daily.temperature_2m_min[idx]);
+  const pop = cache.daily.precipitation_probability_max[idx];
+  const psum = cache.daily.precipitation_sum[idx];
+  const wcode = cache.daily.weathercode[idx];
+  return `<div class="weather-card">
+    <div class="weather-main">
+      <div class="weather-emoji">${weatherIcon(wcode)}</div>
+      <div class="weather-temps"><span class="weather-tmax">${tmax}°</span><span class="weather-tmin">/ ${tmin}°C</span></div>
+      <div class="weather-desc">${weatherDesc(wcode)}</div>
+    </div>
+    <div class="weather-sub">
+      <span>${geo.label}　·　${DAYS[activeDay].d}</span>
+      <span>☔ 降雨機率 ${pop!=null?pop+'%':'–'}${psum?`　·　${psum}mm`:''}</span>
+    </div>
+    <div class="weather-footer">
+      <span class="weather-updated">更新於 ${updatedStr}</span>
+      <button type="button" class="weather-refresh-btn" onclick="refreshWeather()" ${loading?'disabled':''}>${loading?'更新中…':'🔄 重新整理'}</button>
+    </div>
+  </div>`;
+}
+
 const FLIGHTS = [
   {code:"CX531", from:"台北 TPE · T1", to:"香港 HKG · T1", dep:"9/18 19:55", arr:"9/18 22:00"},
   {code:"CX181", from:"香港 HKG · T1", to:"雪梨 SYD · T1", dep:"9/19 00:45", arr:"9/19 11:45"},
@@ -1017,6 +1203,7 @@ function renderItinerary(){
 
   return `
     <div class="day-scroll" role="tablist" aria-label="選擇天數">${chips}</div>
+    ${renderWeatherCard()}
     <div class="day-head">
       <div>
         <h2>${day.title}</h2>
@@ -1739,6 +1926,7 @@ document.addEventListener('focusout', function(){
 }, true);
 
 buildShell();
+initWeather();
 </script>
 
 <script type="module">
